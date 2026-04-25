@@ -11,9 +11,9 @@ import (
 	"syscall"
 
 	"dash0.com/otlp-log-processor-backend/internal/grpcserver"
-	"dash0.com/otlp-log-processor-backend/internal/legacych"
 	"dash0.com/otlp-log-processor-backend/internal/otelpipe"
 	"dash0.com/otlp-log-processor-backend/internal/store"
+	chstore "dash0.com/otlp-log-processor-backend/internal/store/clickhouse"
 )
 
 var (
@@ -68,11 +68,12 @@ func openStore(ctx context.Context) (store.MetricsStore, error) {
 	case "memory":
 		return store.NewMemory(), nil
 	case "clickhouse":
-		ch, err := legacych.NewStore(ctx, *chAddr, *chDatabase, *chUsername, *chPassword)
-		if err != nil {
-			return nil, err
-		}
-		return legacych.NewWideRowMetricsStore(ch), nil
+		return chstore.Open(ctx, chstore.Config{
+			Addr:     *chAddr,
+			Database: *chDatabase,
+			Username: *chUsername,
+			Password: *chPassword,
+		})
 	default:
 		return nil, errors.New("unknown --store (use memory or clickhouse)")
 	}

@@ -83,3 +83,23 @@ Because the final two-table ClickHouse schema isn't ready yet, I shoved the old 
 * Once the real ClickHouse adapter (with the two-table schema) lands, delete `legacych` entirely. If Ops requests it, we could add separate configurable timeouts for the gRPC drain vs. the batcher flush.
 * Bind environment variables to the server flags (e.g. `LISTEN_ADDR`, `STORE`, ClickHouse creds) so config works the same in Docker/K8s without long command lines.
 * Right now `main` calls `CreateTables` on boot — totally fine for “make it work” and `IF NOT EXISTS` is harmless enough for toy deploys. For actual production I’d **not** lean on that long-term: you want versioned migrations (or at least a dedicated migrate command / job / script), a stricter split of “who can DDL” vs “who can INSERT”, and the server assuming the schema is already there. `CREATE IF NOT EXISTS` doesn’t help you when you need `ALTER`s anyway.
+
+## ClickHouse two-table adapter (`internal/store/clickhouse`)
+
+### Context
+The batcher, mapper, and gRPC stack already speak `store.MetricsStore` with `MetadataRow` / `DatapointRow`. The last step was researching and focus on ClickHouse. The plan was to stop expanding normalized rows back into the legacy wide `GaugeRow` / `SumRow` tables and write the new schema directly: a lookup table for series identity and a single fact table for scalar gauge/sum points.
+
+### Decision
+I added `internal/store/clickhouse` with DDL in `schema.go` and a native `Store` in `store.go` that implements `MetricsStore` end-to-end:
+- **Metadata:** `otel_metrics_metadata` as `ReplacingMergeTree(LastSeen)` on `Fingerprint`, with `Enum8` for gauge vs sum and the usual resource/scope/attribute fields.
+- **Fact:** `otel_metrics_datapoints` as a unified `MergeTree` with the same column layout for gauge and sum points (`Fingerprint`, `StartTimeUnix`, `TimeUnix`, `Value`, `Flags`), `PARTITION BY toDate(TimeUnix)`, `ORDER BY (Fingerprint, TimeUnix)`, and a 30-day TTL for bounded retention.
+- **Advanced Codecs:** Applied TSDB-specific compression: `CODEC(DoubleDelta)` for timestamps and `CODEC(Gorilla)` for float values, drastically reducing the disk footprint compared to standard `LZ4`.
+- **Inserts:** `PrepareBatch` + `Append` for both tables (no string `INSERT` loops). Connection settings set `async_insert = 1`. **`wait_for_async_insert`** defaults to **1** so a successful `Send()` is visible to the next `SELECT` in the same process (useful for tests and any read-after-write); `Config.SkipWaitForAsyncInsert` maps to `0` when you want maximum writer throughput and accept a short visibility lag.
+- **Wiring:** `cmd/server` with `--store=clickhouse` opens this store. The old `internal/legacych` wide-row path remains in the tree for the moment (e.g. its integration tests) but is off the main server path.
+
+### Trade-offs
+* **Pros:** The ingestion path matches the data model: one metadata upsert per batch row and compact datapoint rows without repeating labels on every point. Partitions and `ORDER BY` line up with “no full table scan” for typical series+time queries.
+* **Cons:** `CreateTables` still runs on server boot (same migration caveats as elsewhere). Replacing metadata dedup is asynchronous until `OPTIMIZE … FINAL` or merges — fine for the intended query patterns if you always join or filter on `Fingerprint` / time.
+
+### Future Optimization
+* Optional: a separate migration tool or versioned `ALTER`s instead of `CreateTables` in the server binary for production.
