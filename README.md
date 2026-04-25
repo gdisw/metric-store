@@ -36,6 +36,36 @@ High-level trade-offs (see [`DECISIONS.md`](DECISIONS.md) for detail):
 
 - Go **1.26+** (standard toolchain).
 
+## Local dev with Docker Compose
+
+A two-service stack (this server plus ClickHouse) uses the `clickhouse/clickhouse-server:26.2` image aligned with the integration tests. **Both** services use the same [Compose secret](https://docs.docker.com/compose/how-tos/use-secrets/) file (`./.secrets/ch_password`) mounted at `/run/secrets/ch_password`: the app passes it via `CLICKHOUSE_PASSWORD_FILE`, and the official ClickHouse image reads that path in its entrypoint (so the database user and the Go client always share one password).
+
+1. Create a local secret file from the example (default content is `localdev`):
+
+   ```shell
+   cp .secrets/ch_password.example .secrets/ch_password
+   ```
+
+2. Build and start (the server waits until ClickHouse is healthy):
+
+   ```shell
+   docker compose up --build
+   ```
+
+3. Send test metrics, for example with the OpenTelemetry [`telemetrygen`](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/cmd/telemetrygen) tool:
+
+   ```shell
+   telemetrygen metrics --otlp-insecure --otlp-endpoint=localhost:4317
+   ```
+
+4. Optional: check that datapoints were stored:
+
+   ```shell
+   docker compose exec clickhouse clickhouse-client --password=localdev -q "SELECT count() FROM otel_metrics_datapoints"
+   ```
+
+   Use the same password string as in `.secrets/ch_password` (the example uses `localdev`).
+
 ## Run
 
 **In-memory store** (no ClickHouse):
@@ -44,7 +74,7 @@ High-level trade-offs (see [`DECISIONS.md`](DECISIONS.md) for detail):
 go run ./cmd/server --store=memory
 ```
 
-**ClickHouse** (native interface; ensure ClickHouse is reachable):
+**ClickHouse** (native interface) — the default in flags/env is `localhost:9000`. For a full local stack (server and ClickHouse) without installing ClickHouse on the host, use **Local dev with Docker Compose** above. For an external or host-installed instance, set `CLICKHOUSE_ADDR` and the other `CLICKHOUSE_*` values accordingly:
 
 ```shell
 go run ./cmd/server --store=clickhouse

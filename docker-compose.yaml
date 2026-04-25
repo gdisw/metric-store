@@ -1,0 +1,44 @@
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.2
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD_FILE: /run/secrets/ch_password
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    secrets:
+      - ch_password
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    ports:
+      - "9000:9000"
+      - "8123:8123"
+
+  server:
+    build: .
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    environment:
+      LISTEN_ADDR: "0.0.0.0:4317"
+      STORE: clickhouse
+      CLICKHOUSE_ADDR: "clickhouse:9000"
+      CLICKHOUSE_DATABASE: default
+      CLICKHOUSE_USERNAME: default
+      CLICKHOUSE_PASSWORD_FILE: /run/secrets/ch_password
+    secrets:
+      - ch_password
+    ports:
+      - "4317:4317"
+
+volumes:
+  clickhouse-data: {}
+
+secrets:
+  ch_password:
+    file: ./.secrets/ch_password

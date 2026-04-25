@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sync"
 	"time"
 
 	"go.opentelemetry.io/contrib/bridges/otelslog"
@@ -18,16 +19,22 @@ import (
 	"gdisw/metric-store/internal/store"
 )
 
-var logger = otelslog.NewLogger(store.OTelScopeName)
+var logOnce sync.Once
+var logger *slog.Logger
 
 // Logger returns the package logger (otelslog bridge), configured with
 // [store.OTelScopeName] for trace/log correlation to the same meter.
+//
+// Call after the OpenTelemetry log SDK is installed (e.g. otelpipe.SetupOTelSDK)
+// so the global log LoggerProvider is set; otherwise the bridge uses a no-op
+// provider and container logs look empty.
 func Logger() *slog.Logger {
+	logOnce.Do(func() { logger = otelslog.NewLogger(store.OTelScopeName) })
 	return logger
 }
 
 func logWithTrace(ctx context.Context) *slog.Logger {
-	l := logger
+	l := Logger()
 	if sc := trace.SpanContextFromContext(ctx); sc.IsValid() {
 		l = l.With(
 			"trace_id", sc.TraceID().String(),

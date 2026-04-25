@@ -50,9 +50,6 @@ var (
 func main() {
 	flag.Parse()
 
-	slog.SetDefault(grpcserver.Logger())
-	slog.Info("starting OTLP metrics server", slog.String("version", version))
-
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -65,6 +62,9 @@ func main() {
 			slog.Error("otel shutdown", slog.Any("err", e))
 		}
 	}()
+
+	slog.SetDefault(grpcserver.Logger())
+	slog.Info("starting OTLP metrics server", slog.String("version", version))
 
 	chPassword, err := clickHousePassword()
 	if err != nil {

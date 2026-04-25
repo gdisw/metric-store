@@ -1,2 +1,6 @@
 otlp-log-processor-backend
 .env
+
+# Local Docker Compose secrets (not committed); keep ch_password.example
+.secrets/*
+!.secrets/ch_password.example

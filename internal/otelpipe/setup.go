@@ -115,9 +115,11 @@ func newLoggerProvider() (*log.LoggerProvider, error) {
 		return nil, err
 	}
 
+	// Synchronous export so application logs (otelslog) reach container stdout
+	// before the process can exit; batching can leave Docker logs empty on errors.
 	loggerProvider := log.NewLoggerProvider(
 		log.WithResource(res),
-		log.WithProcessor(log.NewBatchProcessor(logExporter)),
+		log.WithProcessor(log.NewSimpleProcessor(logExporter)),
 	)
 	return loggerProvider, nil
 }
