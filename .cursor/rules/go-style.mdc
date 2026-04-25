@@ -8,6 +8,7 @@ alwaysApply: false
 
 ## API design & Types
 - **Accept interfaces, return structs.** Inputs should be as broad as possible (interfaces like `io.Reader` or our custom `Store`), while outputs should be specific concrete types/structs.
+- **Compile-time interface checks:** ALWAYS include a compile-time check when a struct is meant to implement an interface (e.g., `var _ MetricsStore = (*MemoryStore)(nil)`).
 - `context.Context` is the first parameter of functions that need cancellation, deadlines, or tracing.
 - Avoid mutable global state in `internal/*`; inject dependencies (store, batcher, cache) explicitly via constructors.
 - Libraries under `internal/` must not `panic` for expected failures; return explicit errors.

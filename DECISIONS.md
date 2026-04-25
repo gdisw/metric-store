@@ -19,3 +19,11 @@ I implemented a custom fingerprinting package using the `xxhash/v2` algorithm. T
 
 **Future Optimization:**
 * To further reduce Garbage Collector (GC) pressure under extreme load, I identified the use of `sync.Pool` to reuse `xxhash.Digest` objects. This would move the implementation toward a "zero-allocation" model, which is ideal for a Staff-level production system.
+
+## Interface-First Design and In-Memory Storage
+
+**Context:**
+I need to ship mapping, dedup, batching, and the gRPC path end-to-end, and the whole thing is supposed to land in ClickHouse eventually. I didn’t want to start by gluing all of that to the CH driver, Docker, and schema minutiae — that’s a separate rabbit hole.
+
+**Decision:**
+I’m leaning on a plain Go `MetricsStore` interface (`internal/store/store.go`) so I can wire and exercise the full pipeline first. I added a dumb in-memory impl (`internal/store/memory.go`) for fast unit tests, then I’ll dig into the ClickHouse-specific code when the vertical slice of “real” storage is the only thing left.
