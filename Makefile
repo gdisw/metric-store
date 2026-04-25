@@ -6,7 +6,10 @@ build:
 	go build ./...
 
 run:
-	go run .
+	go run ./cmd/server
+
+run-memory:
+	go run ./cmd/server --store=memory
 
 test:
 	go test -count=1 ./...

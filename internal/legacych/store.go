@@ -1,4 +1,4 @@
-package main
+package legacych
 
 import (
 	"context"
@@ -36,21 +36,13 @@ type SumRow struct {
 	IsMonotonic            bool
 }
 
-// MetricsStore defines the interface for storing metrics in ClickHouse.
-type MetricsStore interface {
-	CreateTables(ctx context.Context) error
-	InsertGauge(ctx context.Context, rows []GaugeRow) error
-	InsertSum(ctx context.Context, rows []SumRow) error
-	Close() error
+// Store implements wide-row gauge/sum (and DDL for other metric tables) against ClickHouse.
+type Store struct {
+	Conn driver.Conn
 }
 
-// ClickHouseMetricsStore implements MetricsStore using a ClickHouse connection.
-type ClickHouseMetricsStore struct {
-	conn driver.Conn
-}
-
-// NewClickHouseMetricsStore creates a new ClickHouseMetricsStore connected to the given address.
-func NewClickHouseMetricsStore(ctx context.Context, addr string, database string, username string, password string) (*ClickHouseMetricsStore, error) {
+// NewStore opens a ClickHouse native connection.
+func NewStore(ctx context.Context, addr, database, username, password string) (*Store, error) {
 	conn, err := clickhouse.Open(&clickhouse.Options{
 		Addr: []string{addr},
 		Auth: clickhouse.Auth{
@@ -70,11 +62,11 @@ func NewClickHouseMetricsStore(ctx context.Context, addr string, database string
 		_ = conn.Close()
 		return nil, fmt.Errorf("pinging clickhouse: %w", err)
 	}
-	return &ClickHouseMetricsStore{conn: conn}, nil
+	return &Store{Conn: conn}, nil
 }
 
-// CreateTables executes DDL for all 5 metric tables.
-func (s *ClickHouseMetricsStore) CreateTables(ctx context.Context) error {
+// CreateTables executes DDL for all metric tables.
+func (s *Store) CreateTables(ctx context.Context) error {
 	ddls := []string{
 		createGaugeTableSQL,
 		createSumTableSQL,
@@ -83,7 +75,7 @@ func (s *ClickHouseMetricsStore) CreateTables(ctx context.Context) error {
 		createSummaryTableSQL,
 	}
 	for _, ddl := range ddls {
-		if err := s.conn.Exec(ctx, ddl); err != nil {
+		if err := s.Conn.Exec(ctx, ddl); err != nil {
 			return fmt.Errorf("creating table: %w", err)
 		}
 	}
@@ -91,8 +83,8 @@ func (s *ClickHouseMetricsStore) CreateTables(ctx context.Context) error {
 }
 
 // InsertGauge batch-inserts gauge rows into otel_metrics_gauge.
-func (s *ClickHouseMetricsStore) InsertGauge(ctx context.Context, rows []GaugeRow) error {
-	batch, err := s.conn.PrepareBatch(ctx, "INSERT INTO otel_metrics_gauge")
+func (s *Store) InsertGauge(ctx context.Context, rows []GaugeRow) error {
+	batch, err := s.Conn.PrepareBatch(ctx, "INSERT INTO otel_metrics_gauge")
 	if err != nil {
 		return fmt.Errorf("preparing gauge batch: %w", err)
 	}
@@ -122,8 +114,8 @@ func (s *ClickHouseMetricsStore) InsertGauge(ctx context.Context, rows []GaugeRo
 }
 
 // InsertSum batch-inserts sum rows into otel_metrics_sum.
-func (s *ClickHouseMetricsStore) InsertSum(ctx context.Context, rows []SumRow) error {
-	batch, err := s.conn.PrepareBatch(ctx, "INSERT INTO otel_metrics_sum")
+func (s *Store) InsertSum(ctx context.Context, rows []SumRow) error {
+	batch, err := s.Conn.PrepareBatch(ctx, "INSERT INTO otel_metrics_sum")
 	if err != nil {
 		return fmt.Errorf("preparing sum batch: %w", err)
 	}
@@ -155,6 +147,6 @@ func (s *ClickHouseMetricsStore) InsertSum(ctx context.Context, rows []SumRow) e
 }
 
 // Close closes the underlying ClickHouse connection.
-func (s *ClickHouseMetricsStore) Close() error {
-	return s.conn.Close()
+func (s *Store) Close() error {
+	return s.Conn.Close()
 }

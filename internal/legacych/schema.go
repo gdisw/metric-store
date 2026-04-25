@@ -1,4 +1,4 @@
-package main
+package legacych
 
 const createGaugeTableSQL = `
 CREATE TABLE IF NOT EXISTS otel_metrics_gauge (

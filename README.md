@@ -47,10 +47,12 @@ Build the application:
 go build ./...
 ```
 
-Run the application:
+Run the application (defaults to in-memory store):
 ```shell
-go run ./...
+go run ./cmd/server
 ```
+
+Or use `make run` / `make run-memory`.
 
 Run tests
 ```shell

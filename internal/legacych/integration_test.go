@@ -1,6 +1,6 @@
 //go:build integration
 
-package main
+package legacych_test
 
 import (
 	"context"
@@ -16,15 +16,31 @@ import (
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
 	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
-
-	"dash0.com/otlp-log-processor-backend/internal/otlpmap"
-
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/metric/noop"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
+
+	"dash0.com/otlp-log-processor-backend/internal/grpcserver"
+	"dash0.com/otlp-log-processor-backend/internal/legacych"
+	"dash0.com/otlp-log-processor-backend/internal/otlpmap"
+	"dash0.com/otlp-log-processor-backend/internal/store"
 )
 
-func setupClickHouse(t *testing.T) (*ClickHouseMetricsStore, func()) {
+func testGRPCMetricsReceivedCounter(t *testing.T) metric.Int64Counter {
+	t.Helper()
+	m := noop.NewMeterProvider().Meter(grpcserver.MeterName)
+	c, err := m.Int64Counter(grpcserver.MetricsReceivedInstrument,
+		metric.WithDescription("The number of metrics received by otlp-metrics-processor-backend"),
+		metric.WithUnit("{metric}"))
+	if err != nil {
+		t.Fatalf("Int64Counter: %v", err)
+	}
+	return c
+}
+
+func setupClickHouse(t *testing.T) (*legacych.Store, func()) {
 	t.Helper()
 	ctx := context.Background()
 
@@ -52,27 +68,72 @@ func setupClickHouse(t *testing.T) (*ClickHouseMetricsStore, func()) {
 	}
 
 	addr := fmt.Sprintf("%s:%s", host, mappedPort.Port())
-	store, err := NewClickHouseMetricsStore(ctx, addr, "default", "default", "test")
+	st, err := legacych.NewStore(ctx, addr, "default", "default", "test")
 	if err != nil {
 		t.Fatalf("creating clickhouse metrics store: %v", err)
 	}
 
 	cleanup := func() {
-		store.Close()
+		_ = st.Close()
 		if err := ctr.Terminate(ctx); err != nil {
 			t.Logf("terminating clickhouse container: %v", err)
 		}
 	}
 
-	return store, cleanup
+	return st, cleanup
+}
+
+func mappedBatchToWideRows(batch otlpmap.MappedBatch) (gauges []legacych.GaugeRow, sums []legacych.SumRow) {
+	if len(batch.Datapoints) == 0 {
+		return nil, nil
+	}
+	meta := make(map[uint64]store.MetadataRow, len(batch.Metadata))
+	for _, m := range batch.Metadata {
+		meta[m.Fingerprint] = m
+	}
+	for _, dp := range batch.Datapoints {
+		m, ok := meta[dp.Fingerprint]
+		if !ok {
+			continue
+		}
+		g := legacych.GaugeRow{
+			ResourceAttributes:    m.ResourceAttributes,
+			ResourceSchemaUrl:     m.ResourceSchemaUrl,
+			ScopeName:             m.ScopeName,
+			ScopeVersion:          m.ScopeVersion,
+			ScopeAttributes:       m.ScopeAttributes,
+			ScopeDroppedAttrCount: m.ScopeDroppedAttrCount,
+			ScopeSchemaUrl:        m.ScopeSchemaUrl,
+			ServiceName:           m.ServiceName,
+			MetricName:            m.MetricName,
+			MetricDescription:     m.MetricDescription,
+			MetricUnit:            m.MetricUnit,
+			Attributes:            m.Attributes,
+			StartTimeUnix:         dp.StartTimeUnix,
+			TimeUnix:              dp.TimeUnix,
+			Value:                 dp.Value,
+			Flags:                 dp.Flags,
+		}
+		switch m.MetricType {
+		case store.MetricTypeGauge:
+			gauges = append(gauges, g)
+		case store.MetricTypeSum:
+			sums = append(sums, legacych.SumRow{
+				GaugeRow:               g,
+				AggregationTemporality: m.AggregationTemporality,
+				IsMonotonic:            m.IsMonotonic,
+			})
+		}
+	}
+	return gauges, sums
 }
 
 func TestCreateTables(t *testing.T) {
-	store, cleanup := setupClickHouse(t)
+	st, cleanup := setupClickHouse(t)
 	defer cleanup()
 
 	ctx := context.Background()
-	if err := store.CreateTables(ctx); err != nil {
+	if err := st.CreateTables(ctx); err != nil {
 		t.Fatalf("creating tables: %v", err)
 	}
 
@@ -86,7 +147,7 @@ func TestCreateTables(t *testing.T) {
 
 	for _, table := range expectedTables {
 		var count uint64
-		err := store.conn.QueryRow(ctx,
+		err := st.Conn.QueryRow(ctx,
 			"SELECT count() FROM system.tables WHERE database = 'default' AND name = $1", table,
 		).Scan(&count)
 		if err != nil {
@@ -99,11 +160,11 @@ func TestCreateTables(t *testing.T) {
 }
 
 func TestInsertGauge(t *testing.T) {
-	store, cleanup := setupClickHouse(t)
+	st, cleanup := setupClickHouse(t)
 	defer cleanup()
 
 	ctx := context.Background()
-	if err := store.CreateTables(ctx); err != nil {
+	if err := st.CreateTables(ctx); err != nil {
 		t.Fatalf("creating tables: %v", err)
 	}
 
@@ -149,8 +210,8 @@ func TestInsertGauge(t *testing.T) {
 	}
 
 	batch := otlpmap.MapRequest(&colmetricspb.ExportMetricsServiceRequest{ResourceMetrics: resourceMetrics}, time.Now())
-	rows, _ := mappedBatchToLegacy(batch)
-	if err := store.InsertGauge(ctx, rows); err != nil {
+	rows, _ := mappedBatchToWideRows(batch)
+	if err := st.InsertGauge(ctx, rows); err != nil {
 		t.Fatalf("inserting gauge rows: %v", err)
 	}
 
@@ -159,7 +220,7 @@ func TestInsertGauge(t *testing.T) {
 		metricName  string
 		value       float64
 	)
-	err := store.conn.QueryRow(ctx,
+	err := st.Conn.QueryRow(ctx,
 		"SELECT ServiceName, MetricName, Value FROM otel_metrics_gauge WHERE MetricName = 'cpu.utilization'",
 	).Scan(&serviceName, &metricName, &value)
 	if err != nil {
@@ -178,11 +239,11 @@ func TestInsertGauge(t *testing.T) {
 }
 
 func TestInsertSum(t *testing.T) {
-	store, cleanup := setupClickHouse(t)
+	st, cleanup := setupClickHouse(t)
 	defer cleanup()
 
 	ctx := context.Background()
-	if err := store.CreateTables(ctx); err != nil {
+	if err := st.CreateTables(ctx); err != nil {
 		t.Fatalf("creating tables: %v", err)
 	}
 
@@ -233,8 +294,8 @@ func TestInsertSum(t *testing.T) {
 	}
 
 	batch := otlpmap.MapRequest(&colmetricspb.ExportMetricsServiceRequest{ResourceMetrics: resourceMetrics}, time.Now())
-	_, rows := mappedBatchToLegacy(batch)
-	if err := store.InsertSum(ctx, rows); err != nil {
+	_, rows := mappedBatchToWideRows(batch)
+	if err := st.InsertSum(ctx, rows); err != nil {
 		t.Fatalf("inserting sum rows: %v", err)
 	}
 
@@ -245,7 +306,7 @@ func TestInsertSum(t *testing.T) {
 		aggregationTemporality int32
 		isMonotonic            bool
 	)
-	err := store.conn.QueryRow(ctx,
+	err := st.Conn.QueryRow(ctx,
 		"SELECT ServiceName, MetricName, Value, AggregationTemporality, IsMonotonic FROM otel_metrics_sum WHERE MetricName = 'http.requests.total'",
 	).Scan(&serviceName, &metricName, &value, &aggregationTemporality, &isMonotonic)
 	if err != nil {
@@ -270,18 +331,26 @@ func TestInsertSum(t *testing.T) {
 }
 
 func TestGRPCToClickHouse(t *testing.T) {
-	store, cleanup := setupClickHouse(t)
+	chStore, cleanup := setupClickHouse(t)
 	defer cleanup()
 
 	ctx := context.Background()
-	if err := store.CreateTables(ctx); err != nil {
+	if err := chStore.CreateTables(ctx); err != nil {
 		t.Fatalf("creating tables: %v", err)
 	}
 
-	// Start gRPC server wired to the ClickHouse store.
+	adapter := legacych.NewWideRowMetricsStore(chStore)
+	batcher, err := store.NewBatcher(adapter, store.DefaultBatcherConfig())
+	if err != nil {
+		t.Fatalf("NewBatcher: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = batcher.Flush(context.Background())
+	})
+
 	lis := bufconn.Listen(1024 * 1024)
 	grpcServer := grpc.NewServer()
-	colmetricspb.RegisterMetricsServiceServer(grpcServer, newServer("bufconn", store))
+	colmetricspb.RegisterMetricsServiceServer(grpcServer, grpcserver.NewMetricsService(batcher, testGRPCMetricsReceivedCounter(t)))
 	go func() {
 		if err := grpcServer.Serve(lis); err != nil {
 			log.Printf("error serving server: %v", err)
@@ -302,7 +371,6 @@ func TestGRPCToClickHouse(t *testing.T) {
 
 	client := colmetricspb.NewMetricsServiceClient(conn)
 
-	// Send a gauge metric via gRPC.
 	now := uint64(time.Now().UnixNano())
 	_, err = client.Export(ctx, &colmetricspb.ExportMetricsServiceRequest{
 		ResourceMetrics: []*metricspb.ResourceMetrics{
@@ -339,13 +407,16 @@ func TestGRPCToClickHouse(t *testing.T) {
 		t.Fatalf("exporting metrics via grpc: %v", err)
 	}
 
-	// Verify the metric landed in ClickHouse.
+	if err := batcher.Flush(ctx); err != nil {
+		t.Fatalf("flush batcher: %v", err)
+	}
+
 	var (
 		svcName    string
 		metricName string
 		value      float64
 	)
-	err = store.conn.QueryRow(ctx,
+	err = chStore.Conn.QueryRow(ctx,
 		"SELECT ServiceName, MetricName, Value FROM otel_metrics_gauge WHERE MetricName = 'e2e.gauge'",
 	).Scan(&svcName, &metricName, &value)
 	if err != nil {

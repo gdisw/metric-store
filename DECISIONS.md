@@ -60,3 +60,26 @@ I implemented `internal/store/batcher.go` against `MetricsStore` only: two bound
 ### Future Optimization
 * Emit the planned OTel metrics (`queue.dropped`, batch latency, etc.) on top of the existing hooks.
 * Reuse growable slices across flushes (e.g. `buf = buf[:0]`) to cut allocations in the hot path; optional `sync.Pool` if profiling says it matters.
+
+## gRPC server package, `cmd/server`, and shutdown order
+
+### Context
+The old `main.go` was a monolithic script: listen, serve, and hard-kill on exit. It also hardcoded the legacy wide-row schema. To ship a production-grade ingestion pipeline, we needed a real process lifecycle: stop accepting traffic, drain the queues, flush to disk, and disconnect cleanly.
+
+### Decision
+I split the entrypoint into `cmd/server/main.go` (process lifecycle, flags, OTel wiring) and `internal/grpcserver` (the OTLP handler).
+Crucially, I wired a proper shutdown sequence tied to `SIGINT`/`SIGTERM`:
+ 1. `grpcServer.GracefulStop()` (stop taking new requests)
+ 2. `batcher.Flush(ctx)` (drain channels to the store)
+ 3. `store.Close()`
+
+Because the final two-table ClickHouse schema isn't ready yet, I shoved the old wide-row logic into a temporary `internal/legacych` adapter that satisfies the new `MetricsStore` interface.
+
+### Trade-offs
+* **Pros:** The shutdown order is explicit and prod-ready. Backpressure maps correctly to `ResourceExhausted`.
+* **Cons:** I debated whether splitting these packages (`cmd`, `grpcserver`, `legacych`) was premature. Moving code and fixing imports slowed down velocity. I could have shipped the signal handling + batcher inside a fat `main.go` and peeled it apart later. I did it now for the clean boundaries, but it definitely added mental overhead. Also, the temporary `legacych` adapter is a hack (caching metadata to rebuild wide rows), but it keeps tests green.
+
+### Future Optimization
+* Once the real ClickHouse adapter (with the two-table schema) lands, delete `legacych` entirely. If Ops requests it, we could add separate configurable timeouts for the gRPC drain vs. the batcher flush.
+* Bind environment variables to the server flags (e.g. `LISTEN_ADDR`, `STORE`, ClickHouse creds) so config works the same in Docker/K8s without long command lines.
+* Right now `main` calls `CreateTables` on boot — totally fine for “make it work” and `IF NOT EXISTS` is harmless enough for toy deploys. For actual production I’d **not** lean on that long-term: you want versioned migrations (or at least a dedicated migrate command / job / script), a stricter split of “who can DDL” vs “who can INSERT”, and the server assuming the schema is already there. `CREATE IF NOT EXISTS` doesn’t help you when you need `ALTER`s anyway.
