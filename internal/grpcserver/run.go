@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	"go.opentelemetry.io/otel"
 	colmetricspb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -42,11 +43,26 @@ func Run(ctx context.Context, cfg RunConfig, st store.MetricsStore) error {
 		return errors.New("grpcserver: empty ListenAddr")
 	}
 
+	bm, err := store.NewBatcherMetrics(otel.Meter(store.OTelScopeName))
+	if err != nil {
+		_ = st.Close()
+		return fmt.Errorf("grpcserver: batcher metrics: %w", err)
+	}
+	cfg.Batcher.Metrics = bm
+
 	batcher, err := store.NewBatcher(st, cfg.Batcher)
 	if err != nil {
 		_ = st.Close()
 		return err
 	}
+
+	qreg, err := store.RegisterQueueDepthCallback(otel.Meter(store.OTelScopeName), batcher)
+	if err != nil {
+		_ = batcher.Flush(context.Background())
+		_ = st.Close()
+		return fmt.Errorf("grpcserver: queue depth callback: %w", err)
+	}
+	defer func() { _ = qreg.Unregister() }()
 
 	lis, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
@@ -55,19 +71,20 @@ func Run(ctx context.Context, cfg RunConfig, st store.MetricsStore) error {
 		return err
 	}
 
+	exm, err := DefaultExportMetrics()
+	if err != nil {
+		_ = lis.Close()
+		_ = batcher.Flush(context.Background())
+		_ = st.Close()
+		return fmt.Errorf("grpcserver: export metrics: %w", err)
+	}
+
 	srv := grpc.NewServer(
 		grpc.StatsHandler(otelgrpc.NewServerHandler()),
 		grpc.MaxRecvMsgSize(cfg.MaxRecvMsgSize),
 		grpc.Creds(insecure.NewCredentials()),
 	)
-	receivedCtr, err := DefaultMetricsReceivedCounter()
-	if err != nil {
-		_ = lis.Close()
-		_ = batcher.Flush(context.Background())
-		_ = st.Close()
-		return fmt.Errorf("grpcserver: metrics counter: %w", err)
-	}
-	colmetricspb.RegisterMetricsServiceServer(srv, NewMetricsService(batcher, receivedCtr))
+	colmetricspb.RegisterMetricsServiceServer(srv, NewMetricsService(batcher, exm))
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.Serve(lis) }()

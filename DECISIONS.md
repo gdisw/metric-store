@@ -103,3 +103,22 @@ I added `internal/store/clickhouse` with DDL in `schema.go` and a native `Store`
 
 ### Future Optimization
 * Optional: a separate migration tool or versioned `ALTER`s instead of `CreateTables` in the server binary for production.
+
+## Observability (OTel metrics and structured logging)
+
+### Context
+Ingest, batching, and the LRU cache have operational knobs (backpressure, flush latency, cache effectiveness) that are invisible without telemetry. The refactor plan called for a consistent signal model at the `store` abstraction (so the same metrics mean the same thing with `memory` or ClickHouse) and for logs to carry request correlation where traces exist.
+
+### Decision
+* **Shared scope name:** A single `store.OTelScopeName` string (`go.opentelemetry.io/otel` meter name) is used for the gRPC export path and the batcher so dashboards and the stdout metric exporter group instruments predictably. The default logger uses the `otelslog` bridge with the same name.
+* **gRPC / mapper (`internal/grpcserver`):** `otlp.export.received` counts every `Export` RPC. `otlp.datapoints.processed` counts mapped scalar points **after** a successful `Enqueue` (so `ResourceExhausted` from backpressure does not inflate it), with attribute `type` = `gauge` / `sum` (or `unknown` if metadata is missing a fingerprint). Structured logs on the hot path add `trace_id` and `span_id` from `trace.SpanContextFromContext` for correlation; backpressure is logged at **warn** with the error.
+* **Batcher (`internal/store`):** Optional `BatcherConfig.Metrics` wires `metadata.cache.hit` and `metadata.cache.miss` around the LRU peek in `Enqueue`. Successful `UpsertMetadata` / `InsertDatapoints` report `store.batch.inserted` (attribute `kind`) and `store.batch.latency` (seconds, by `kind`). Final failures after retries report `store.batch.failed` (with `kind` and a short `reason`). Channel saturation increments both the existing internal drop counter and `queue.dropped`. `queue.depth` is an `Int64ObservableGauge` with `RegisterQueueDepthCallback` on the meter, with attribute `queue` = `metadata` | `datapoints`.
+* **Wiring:** `grpcserver.Run` builds `BatcherMetrics` for the given meter, sets `BatcherConfig.Metrics`, registers the queue-depth callback (unregistered on return), and creates `DefaultExportMetrics` for the gRPC service. The process must set the global `MeterProvider` (e.g. `otelpipe.SetupOTelSDK` in `cmd/server/main.go`) before `Run` for non-noop export.
+
+### Trade-offs
+* **Pros:** No ClickHouse or extra deps in the metric definitions beyond `otel/metric` and the existing SDK; the same instruments apply to the memory store in tests and to production.
+* **Cons:** A large surface of instrument names and attributes; any rename is a breaking change for dashboards. Observable callbacks for queue depth are tied to the batcher’s lifetime. Datapoint “processed” is defined as accepted into the async queue, not yet persisted, which matches “past backpressure” but is not a strict end-to-end commit guarantee.
+
+### Future Optimization
+* Optional: export a OTLP metrics endpoint in addition to the stdout periodic reader, or pluggable exporters in `otelpipe` for different environments.
+* Optional: add exemplars to histograms or link `store.batch` spans to the originating gRPC trace for deeper drill-down.

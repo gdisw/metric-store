@@ -7,8 +7,9 @@ import (
 	"time"
 
 	"go.opentelemetry.io/contrib/bridges/otelslog"
-	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 	colmetricspb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -17,44 +18,44 @@ import (
 	"dash0.com/otlp-log-processor-backend/internal/store"
 )
 
-const (
-	MeterName                 = "dash0.com/otlp-log-processor-backend"
-	MetricsReceivedInstrument = "com.dash0.homeexercise.metrics.received"
-)
+var logger = otelslog.NewLogger(store.OTelScopeName)
 
-var logger = otelslog.NewLogger(MeterName)
-
-// DefaultMetricsReceivedCounter builds the standard counter from the global [otel.MeterProvider]
-// (configure OTel before calling; used by [Run] and production wiring).
-func DefaultMetricsReceivedCounter() (metric.Int64Counter, error) {
-	m := otel.Meter(MeterName)
-	return m.Int64Counter(MetricsReceivedInstrument,
-		metric.WithDescription("The number of metrics received by otlp-metrics-processor-backend"),
-		metric.WithUnit("{metric}"))
-}
-
-// Logger returns the package logger (otelslog bridge).
+// Logger returns the package logger (otelslog bridge), configured with
+// [store.OTelScopeName] for trace/log correlation to the same meter.
 func Logger() *slog.Logger {
 	return logger
 }
 
+func logWithTrace(ctx context.Context) *slog.Logger {
+	l := logger
+	if sc := trace.SpanContextFromContext(ctx); sc.IsValid() {
+		l = l.With(
+			"trace_id", sc.TraceID().String(),
+			"span_id", sc.SpanID().String(),
+		)
+	}
+	return l
+}
+
 // MetricsService implements OTLP metrics export using a [store.Batcher].
 type MetricsService struct {
-	batcher         *store.Batcher
-	metricsReceived metric.Int64Counter
+	batcher  *store.Batcher
+	exporter *ExportMetrics
 	colmetricspb.UnimplementedMetricsServiceServer
 }
 
 // NewMetricsService builds a gRPC handler that enqueues mapped rows into batcher.
-// metricsReceived is invoked on every Export (use [DefaultMetricsReceivedCounter] in production, or a noop/test meter in tests).
-func NewMetricsService(b *store.Batcher, metricsReceived metric.Int64Counter) *MetricsService {
-	return &MetricsService{batcher: b, metricsReceived: metricsReceived}
+// exporter may be nil in tests; production wiring should pass [DefaultExportMetrics].
+func NewMetricsService(b *store.Batcher, exporter *ExportMetrics) *MetricsService {
+	return &MetricsService{batcher: b, exporter: exporter}
 }
 
 // Export implements [colmetricspb.MetricsServiceServer].
 func (s *MetricsService) Export(ctx context.Context, request *colmetricspb.ExportMetricsServiceRequest) (*colmetricspb.ExportMetricsServiceResponse, error) {
-	slog.DebugContext(ctx, "Received ExportMetricsServiceRequest")
-	s.metricsReceived.Add(ctx, 1)
+	if s.exporter != nil {
+		s.exporter.ExportReceived.Add(ctx, 1)
+	}
+	logWithTrace(ctx).DebugContext(ctx, "export metrics: received request")
 
 	batch := otlpmap.MapRequest(request, time.Now())
 	if len(batch.Metadata) == 0 && len(batch.Datapoints) == 0 {
@@ -62,9 +63,36 @@ func (s *MetricsService) Export(ctx context.Context, request *colmetricspb.Expor
 	}
 	if err := s.batcher.Enqueue(ctx, batch.Metadata, batch.Datapoints); err != nil {
 		if errors.Is(err, store.ErrBackpressure) {
+			logWithTrace(ctx).WarnContext(ctx, "export metrics: backpressure, queue full", slog.String("err", err.Error()))
 			return nil, status.Error(codes.ResourceExhausted, err.Error())
 		}
 		return nil, err
 	}
+	if s.exporter != nil {
+		counts := datapointCountsByMetricType(batch)
+		for typ, n := range counts {
+			if n > 0 {
+				s.exporter.DatapointsByType.Add(ctx, n, metric.WithAttributes(
+					attribute.String("type", typ),
+				))
+			}
+		}
+	}
 	return &colmetricspb.ExportMetricsServiceResponse{}, nil
+}
+
+func datapointCountsByMetricType(batch otlpmap.MappedBatch) map[string]int64 {
+	byFP := make(map[uint64]string, len(batch.Metadata))
+	for _, m := range batch.Metadata {
+		byFP[m.Fingerprint] = string(m.MetricType)
+	}
+	out := make(map[string]int64)
+	for _, d := range batch.Datapoints {
+		typ := byFP[d.Fingerprint]
+		if typ == "" {
+			typ = "unknown"
+		}
+		out[typ]++
+	}
+	return out
 }

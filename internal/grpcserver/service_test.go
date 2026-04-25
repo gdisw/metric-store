@@ -22,16 +22,24 @@ import (
 	"dash0.com/otlp-log-processor-backend/internal/store"
 )
 
-func testMetricsReceivedCounter(t *testing.T) metric.Int64Counter {
+func testExportMetrics(t *testing.T) *grpcserver.ExportMetrics {
 	t.Helper()
-	m := noop.NewMeterProvider().Meter(grpcserver.MeterName)
-	c, err := m.Int64Counter(grpcserver.MetricsReceivedInstrument,
-		metric.WithDescription("The number of metrics received by otlp-metrics-processor-backend"),
-		metric.WithUnit("{metric}"))
+	m := noop.NewMeterProvider().Meter(store.OTelScopeName)
+	recv, err := m.Int64Counter("otlp.export.received",
+		metric.WithDescription("gRPC ExportMetricsServiceRequest invocations (including empty)"),
+		metric.WithUnit("1"),
+	)
 	if err != nil {
-		t.Fatalf("Int64Counter: %v", err)
+		t.Fatalf("otlp.export.received: %v", err)
 	}
-	return c
+	dp, err := m.Int64Counter("otlp.datapoints.processed",
+		metric.WithDescription("Number of mapped scalar datapoints accepted for the store"),
+		metric.WithUnit("1"),
+	)
+	if err != nil {
+		t.Fatalf("otlp.datapoints.processed: %v", err)
+	}
+	return &grpcserver.ExportMetrics{ExportReceived: recv, DatapointsByType: dp}
 }
 
 func TestMetricsService_Export(t *testing.T) {
@@ -50,7 +58,7 @@ func TestMetricsService_Export(t *testing.T) {
 	buffer := 101024 * 1024
 	lis := bufconn.Listen(buffer)
 	srv := grpc.NewServer()
-	colmetricspb.RegisterMetricsServiceServer(srv, grpcserver.NewMetricsService(b, testMetricsReceivedCounter(t)))
+	colmetricspb.RegisterMetricsServiceServer(srv, grpcserver.NewMetricsService(b, testExportMetrics(t)))
 	go func() {
 		if err := srv.Serve(lis); err != nil {
 			log.Printf("bufconn serve: %v", err)

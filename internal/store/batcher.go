@@ -41,6 +41,9 @@ type BatcherConfig struct {
 	FlushInterval       time.Duration
 	LRUMaxEntries       int
 	MaxBatchRetries     int
+	// Metrics is optional: when set, OpenTelemetry counters, histograms, and
+	// [RegisterQueueDepthCallback] observe queue backpressure, cache behavior, and store batches.
+	Metrics *BatcherMetrics
 }
 
 func DefaultBatcherConfig() BatcherConfig {
@@ -102,6 +105,11 @@ func NewBatcher(store MetricsStore, cfg BatcherConfig) (*Batcher, error) {
 	return b, nil
 }
 
+// ChannelDepths returns the number of pending messages in the metadata and datapoint channels.
+func (b *Batcher) ChannelDepths() (metadata int, datapoints int) {
+	return len(b.metaCh), len(b.dpCh)
+}
+
 // Dropped counts rows not queued due to [ErrBackpressure].
 func (b *Batcher) Dropped() uint64 {
 	return b.drop.Load()
@@ -138,14 +146,24 @@ func (b *Batcher) Enqueue(ctx context.Context, metadata []MetadataRow, datapoint
 	needDp := len(datapoints)
 
 	if needMeta > cap(b.metaCh)-len(b.metaCh) || needDp > cap(b.dpCh)-len(b.dpCh) {
-		b.drop.Add(uint64(len(metadata) + len(datapoints)))
+		n := int64(len(metadata) + len(datapoints))
+		b.drop.Add(uint64(n))
+		if b.cfg.Metrics != nil {
+			b.cfg.Metrics.OnQueueDropped(ctx, n)
+		}
 		return ErrBackpressure
 	}
 
 	for i := range metadata {
 		row := metadata[i]
 		if _, hit := b.lru.Peek(row.Fingerprint); hit {
+			if b.cfg.Metrics != nil {
+				b.cfg.Metrics.OnCacheHit(ctx)
+			}
 			continue
+		}
+		if b.cfg.Metrics != nil {
+			b.cfg.Metrics.OnCacheMiss(ctx)
 		}
 		b.metaCh <- row
 	}
@@ -276,15 +294,26 @@ func (b *Batcher) writeBatchesWithRetry(ctx context.Context, meta []MetadataRow,
 			return err
 		}
 		if len(remainingMeta) > 0 {
+			t0 := time.Now()
 			if err := b.store.UpsertMetadata(ctx, remainingMeta); err != nil {
 				if isNonRetriableErr(err) {
+					if b.cfg.Metrics != nil {
+						b.cfg.Metrics.OnBatchFailed(ctx, "metadata", err)
+					}
 					return fmt.Errorf("store batcher: UpsertMetadata: %w", err)
 				}
 				if attempt == retries-1 {
+					if b.cfg.Metrics != nil {
+						b.cfg.Metrics.OnBatchFailed(ctx, "metadata", err)
+					}
 					return fmt.Errorf("store batcher: UpsertMetadata: %w", err)
 				}
 				b.backoff(ctx, attempt)
 				continue
+			}
+			if b.cfg.Metrics != nil {
+				b.cfg.Metrics.OnBatchLatency(ctx, "metadata", time.Since(t0))
+				b.cfg.Metrics.OnBatchInserted(ctx, "metadata", int64(len(remainingMeta)))
 			}
 			for _, r := range remainingMeta {
 				b.lru.Add(r.Fingerprint, struct{}{})
@@ -292,15 +321,26 @@ func (b *Batcher) writeBatchesWithRetry(ctx context.Context, meta []MetadataRow,
 			remainingMeta = nil
 		}
 		if len(remainingDps) > 0 {
+			t0 := time.Now()
 			if err := b.store.InsertDatapoints(ctx, remainingDps); err != nil {
 				if isNonRetriableErr(err) {
+					if b.cfg.Metrics != nil {
+						b.cfg.Metrics.OnBatchFailed(ctx, "datapoints", err)
+					}
 					return fmt.Errorf("store batcher: InsertDatapoints: %w", err)
 				}
 				if attempt == retries-1 {
+					if b.cfg.Metrics != nil {
+						b.cfg.Metrics.OnBatchFailed(ctx, "datapoints", err)
+					}
 					return fmt.Errorf("store batcher: InsertDatapoints: %w", err)
 				}
 				b.backoff(ctx, attempt)
 				continue
+			}
+			if b.cfg.Metrics != nil {
+				b.cfg.Metrics.OnBatchLatency(ctx, "datapoints", time.Since(t0))
+				b.cfg.Metrics.OnBatchInserted(ctx, "datapoints", int64(len(remainingDps)))
 			}
 			remainingDps = nil
 		}
