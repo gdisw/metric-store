@@ -52,16 +52,18 @@ go run ./cmd/server --store=clickhouse
 
 Plain `go run ./cmd/server` uses the **default** `--store` from flags (`memory` unless you pass `--store=clickhouse`).
 
-Useful flags (see `cmd/server/main.go`):
+Useful flags (see `cmd/server/main.go`); for each option the default comes from the **Env var** (if set) or the **Default** column, and an explicit flag still wins over the environment. A commented template for the same variables is in [`.env.sample`](.env.sample) — copy to `.env` and load into your environment (this repo does not auto-read `.env` in Go).
 
-| Flag | Default | Purpose |
-|------|---------|---------|
-| `--listenAddr` | `localhost:4317` | gRPC listen address |
-| `--store` | `memory` | `memory` or `clickhouse` |
-| `--clickhouse.addr` | `localhost:9000` | Native protocol `host:port` |
-| `--clickhouse.database` | `default` | Database name |
-| `--clickhouse.username` | `default` | User |
-| `--clickhouse.password` | *(empty)* | Password |
+| Flag | Env var | Default | Purpose |
+|------|---------|---------|---------|
+| `--listenAddr` | `LISTEN_ADDR` | `localhost:4317` | gRPC listen address |
+| `--maxReceiveMessageSize` | `MAX_RECV_MSG_SIZE` | `16777216` | Max gRPC receive message size in bytes |
+| `--store` | `STORE` | `memory` | `memory` or `clickhouse` |
+| `--clickhouse.addr` | `CLICKHOUSE_ADDR` | `localhost:9000` | Native protocol `host:port` |
+| `--clickhouse.database` | `CLICKHOUSE_DATABASE` | `default` | Database name |
+| `--clickhouse.username` | `CLICKHOUSE_USERNAME` | `default` | User |
+| — | `CLICKHOUSE_PASSWORD` | *(empty)* | ClickHouse password (env only; no flag). Used when `CLICKHOUSE_PASSWORD_FILE` is unset. For production, prefer a file or secret mount over a literal in the environment. |
+| `--clickhouse.password-file` | `CLICKHOUSE_PASSWORD_FILE` | *(empty)* | Path to a file whose contents (trimmed of trailing newlines) are used as the password. If set, it overrides `CLICKHOUSE_PASSWORD`. Omit both for an empty password. |
 
 On startup the server calls `CreateTables` on the store (`IF NOT EXISTS` DDL for ClickHouse).
 

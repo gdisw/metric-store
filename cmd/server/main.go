@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 
 	"gdisw/metric-store/internal/grpcserver"
@@ -16,17 +19,35 @@ import (
 	chstore "gdisw/metric-store/internal/store/clickhouse"
 )
 
+func envOr(key, def string) string {
+	if v, ok := os.LookupEnv(key); ok && v != "" {
+		return v
+	}
+	return def
+}
+
+func envIntOr(key string, def int) int {
+	if v, ok := os.LookupEnv(key); ok && v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
 var (
-	listenAddr            = flag.String("listenAddr", "localhost:4317", "gRPC listen address")
-	maxReceiveMessageSize = flag.Int("maxReceiveMessageSize", 16777216, "max receive message size in bytes")
-	storeKind             = flag.String("store", "memory", "metrics backend: memory or clickhouse")
-	chAddr                = flag.String("clickhouse.addr", "localhost:9000", "ClickHouse native address host:port")
-	chDatabase            = flag.String("clickhouse.database", "default", "ClickHouse database")
-	chUsername            = flag.String("clickhouse.username", "default", "ClickHouse username")
-	chPassword            = flag.String("clickhouse.password", "", "ClickHouse password")
+	listenAddr            = flag.String("listenAddr", envOr("LISTEN_ADDR", "localhost:4317"), "gRPC listen address")
+	maxReceiveMessageSize = flag.Int("maxReceiveMessageSize", envIntOr("MAX_RECV_MSG_SIZE", 16777216), "max receive message size in bytes")
+	storeKind             = flag.String("store", envOr("STORE", "memory"), "metrics backend: memory or clickhouse")
+	chAddr                = flag.String("clickhouse.addr", envOr("CLICKHOUSE_ADDR", "localhost:9000"), "ClickHouse native address host:port")
+	chDatabase            = flag.String("clickhouse.database", envOr("CLICKHOUSE_DATABASE", "default"), "ClickHouse database")
+	chUsername            = flag.String("clickhouse.username", envOr("CLICKHOUSE_USERNAME", "default"), "ClickHouse username")
+	chPasswordFile        = flag.String("clickhouse.password-file", envOr("CLICKHOUSE_PASSWORD_FILE", ""), "path to file containing ClickHouse password; empty for no password")
 )
 
 func main() {
+	flag.Parse()
+
 	slog.SetDefault(grpcserver.Logger())
 	slog.Info("starting OTLP metrics server")
 
@@ -43,9 +64,12 @@ func main() {
 		}
 	}()
 
-	flag.Parse()
+	chPassword, err := clickHousePassword()
+	if err != nil {
+		log.Fatal(err)
+	}
 
-	st, err := openStore(ctx)
+	st, err := openStore(ctx, chPassword)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -63,7 +87,21 @@ func main() {
 	}
 }
 
-func openStore(ctx context.Context) (store.MetricsStore, error) {
+func clickHousePassword() (string, error) {
+	if *chPasswordFile != "" {
+		b, err := os.ReadFile(*chPasswordFile)
+		if err != nil {
+			return "", fmt.Errorf("read clickhouse password file: %w", err)
+		}
+		return strings.TrimRight(string(b), "\r\n"), nil
+	}
+	if v, ok := os.LookupEnv("CLICKHOUSE_PASSWORD"); ok && v != "" {
+		return v, nil
+	}
+	return "", nil
+}
+
+func openStore(ctx context.Context, chPassword string) (store.MetricsStore, error) {
 	switch *storeKind {
 	case "memory":
 		return store.NewMemory(), nil
@@ -72,7 +110,7 @@ func openStore(ctx context.Context) (store.MetricsStore, error) {
 			Addr:     *chAddr,
 			Database: *chDatabase,
 			Username: *chUsername,
-			Password: *chPassword,
+			Password: chPassword,
 		})
 	default:
 		return nil, errors.New("unknown --store (use memory or clickhouse)")
