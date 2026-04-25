@@ -1,63 +1,109 @@
 # OTLP Metric Storage (Go)
 
 ## Introduction
-This take-home assignment is designed to give you an opportunity to demonstrate your skills and experience in
-building a small backend application. We expect you to spend 3-4 hours on this assignment (using AI coding agents).
-If you find yourself spending more time than that, please stop and submit what you have. We are not looking for a
-complete solution, but rather a demonstration of your skills and experience.
 
-To submit your solution, please create a public GitHub repository and send us the link. Please include a `README.md` file
-with instructions on how to run your application.
+This repository implements a small backend that receives [OpenTelemetry metrics](https://opentelemetry.io/docs/concepts/signals/metrics/) over OTLP/gRPC, maps them to a normalized store model (metadata lookup + scalar datapoints), and persists them via a pluggable `store.MetricsStore` implementation (in-memory for fast tests, ClickHouse for production-shaped workloads).
 
-## Overview
-The goal of this assignment is to build a simple backend application that receives [metric datapoints](https://opentelemetry.io/docs/concepts/signals/metrics/)
-on a gRPC endpoint and processes them, before storing in ClickHouse.
-Current state is that we have a gRPC endpoint for receiving metrics, and Gauge and Sum type get correctly converted to
-records and inserted into ClickHouse. This is tested with both unit- and integration-tests.
+## Architecture
 
-What we're looking for is to extract meta-data about the metrics into a separate table, which will then act as a 'lookup'
-table, and that actual data-points just get stored as value + timestamp and with a reference to the lookup table.
+Ingestion is interface-first: the gRPC service maps OTLP to `MetadataRow` / `DatapointRow`, enqueues through an async batcher with LRU metadata deduplication, and writes through `MetricsStore`. ClickHouse uses a two-table layout: `ReplacingMergeTree` metadata keyed by fingerprint and a unified `MergeTree` fact table for gauge and sum scalars, partitioned by day on event time.
 
-Think about and keep in mind the following things:
-- How to do the reference between tables?
-- How to efficiently store the meta-data in ClickHouse?
-- All data should be stored in such a way that full table scans are never needed, under the assumption data always gets queried for a specific time-frame
-- Other than time-frame, there are no other mandatory filters for querying
-- While you can assume cardinality of the metrics is 'low', e.g. Resources (Attributes) are likely to change over time 
+```mermaid
+flowchart LR
+    Client[OTLP Client] -->|"gRPC Export()"| GrpcSvc[grpcserver.MetricsService]
+    GrpcSvc --> Mapper[otlpmap.Mapper]
+    Mapper -->|"MappedBatch"| Batcher[store.Batcher]
+    Batcher -->|"MetricsStore"| Store{{MetricsStore}}
+    Store --> Memory[memory store]
+    Store --> CH[clickhouse.Store]
+    CH --> Meta[(otel_metrics_metadata)]
+    CH --> Fact[(otel_metrics_datapoints)]
+```
 
-Your solution should take into account high throughput, both in number of messages and the number of metrics / data-points per message.
+## Design decisions
 
-Feel free to use the existing scaffoling in this folder. Of course, you can also change anything else as you see fit.
+High-level trade-offs (see [`DECISIONS.md`](DECISIONS.md) for detail):
 
-## Technology Constraints
-- Your Go program should compile using standard Go SDK, and be compatible with Go 1.26.
-- Use any additional libraries you want and need.
+- **Fingerprinting:** Canonical `xxhash` over sorted maps and length-prefixed strings gives a deterministic 64-bit series id without JSON in the hot path.
+- **Interface-first storage:** `MetricsStore` plus an in-memory implementation keep mapping, batching, and gRPC tests free of the ClickHouse driver until you opt in.
+- **Two-table model:** Metadata (labels, scope, resource, sum temporality) lives in `otel_metrics_metadata`; datapoints store only time, value, flags, and `Fingerprint`, so fact rows stay narrow and gauges/sums share one scalar shape.
+- **ClickHouse layout:** Metadata uses `ReplacingMergeTree(LastSeen)` for idempotent upserts; datapoints use `PARTITION BY toDate(TimeUnix)` and `ORDER BY (Fingerprint, TimeUnix)` so typical series+time-range queries prune partitions and use the primary key.
+- **Batcher:** Bounded channels, periodic and size-triggered flush, LRU skip for metadata already written, retries with backoff, and `ErrBackpressure` when queues are full.
+- **Shutdown:** `SIGINT`/`SIGTERM` → graceful gRPC stop → batcher flush → store close.
+- **Observability:** OTel metrics and structured logs at the store abstraction (same instruments for memory and ClickHouse). See **Operational notes** below.
 
-## Notes
-- As this assignment is for the role of a Staff / Senior Product Engineer, we expect you to pay some attention to maintainability and operability of the solution. For example:
-  - Consistent terminology usage
-  - Validation of the behaviour
-  - Include signals / events to help in debugging
-- Assume that this application will be deployed to production. Build it accordingly.
+## Requirements
 
-## Usage
+- Go **1.26+** (standard toolchain).
 
-Build the application:
+## Run
+
+**In-memory store** (no ClickHouse):
+
 ```shell
+go run ./cmd/server --store=memory
+```
+
+**ClickHouse** (native interface; ensure ClickHouse is reachable):
+
+```shell
+go run ./cmd/server --store=clickhouse
+```
+
+Plain `go run ./cmd/server` uses the **default** `--store` from flags (`memory` unless you pass `--store=clickhouse`).
+
+Useful flags (see `cmd/server/main.go`):
+
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `--listenAddr` | `localhost:4317` | gRPC listen address |
+| `--store` | `memory` | `memory` or `clickhouse` |
+| `--clickhouse.addr` | `localhost:9000` | Native protocol `host:port` |
+| `--clickhouse.database` | `default` | Database name |
+| `--clickhouse.username` | `default` | User |
+| `--clickhouse.password` | *(empty)* | Password |
+
+On startup the server calls `CreateTables` on the store (`IF NOT EXISTS` DDL for ClickHouse).
+
+## Build and test
+
+```shell
+make build
+# or
 go build ./...
+
+make test
+# or
+go test -count=1 ./...
+
+make test-integration   # ClickHouse via testcontainers; build tag integration
 ```
 
-Run the application (defaults to in-memory store):
-```shell
-go run ./cmd/server
+## Query example (ClickHouse)
+
+Join the fact table to metadata and filter by metric type and time (always bound `TimeUnix` so partitions prune):
+
+```sql
+SELECT
+    m.MetricName,
+    dp.TimeUnix,
+    dp.Value
+FROM otel_metrics_datapoints AS dp
+INNER JOIN otel_metrics_metadata AS m USING (Fingerprint)
+WHERE m.MetricType = 'gauge'
+  AND dp.TimeUnix >= toDateTime64('2026-01-01 00:00:00', 9)
+  AND dp.TimeUnix <  toDateTime64('2026-01-02 00:00:00', 9)
+ORDER BY m.MetricName, dp.TimeUnix;
 ```
 
-Or use `make run` / `make run-memory`.
+## Operational notes
 
-Run tests
-```shell
-go test ./...
-```
+- **Emitted metrics** (OTel; meter scope aligns with `store.OTelScopeName` in code): `otlp.export.received`, `otlp.datapoints.processed` (attribute `type`: `gauge` / `sum`), `metadata.cache.hit` / `metadata.cache.miss`, `store.batch.inserted` and `store.batch.failed` (attribute `kind`: `metadata` / `datapoints`), `store.batch.latency` (histogram), `queue.depth` (observable gauge per queue), `queue.dropped`.
+- **Backpressure:** When metadata or datapoint queues are full, enqueue returns `ErrBackpressure`; the gRPC handler maps this to `ResourceExhausted`. Drops increment `queue.dropped`.
+- **Datapoint “processed” counter:** Counts points accepted into the batcher after successful enqueue, not necessarily persisted yet; use batch/store metrics for write health.
+- **Metadata dedup:** LRU reduces repeat `UpsertMetadata` calls; occasional duplicate upserts for the same new fingerprint are safe with `ReplacingMergeTree`.
+- **Logs:** Structured `slog` on the export path includes `trace_id` / `span_id` when a span context is present; backpressure is logged at warn.
+- **Retention:** Datapoints table DDL applies a TTL (see `internal/store/clickhouse/schema.go`); adjust for your environment.
 
 ## References
 
