@@ -16,6 +16,9 @@ import (
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
 	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
+
+	"dash0.com/otlp-log-processor-backend/internal/otlpmap"
+
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
@@ -145,7 +148,8 @@ func TestInsertGauge(t *testing.T) {
 		},
 	}
 
-	rows := MapGaugeRows(resourceMetrics)
+	batch := otlpmap.MapRequest(&colmetricspb.ExportMetricsServiceRequest{ResourceMetrics: resourceMetrics}, time.Now())
+	rows, _ := mappedBatchToLegacy(batch)
 	if err := store.InsertGauge(ctx, rows); err != nil {
 		t.Fatalf("inserting gauge rows: %v", err)
 	}
@@ -228,7 +232,8 @@ func TestInsertSum(t *testing.T) {
 		},
 	}
 
-	rows := MapSumRows(resourceMetrics)
+	batch := otlpmap.MapRequest(&colmetricspb.ExportMetricsServiceRequest{ResourceMetrics: resourceMetrics}, time.Now())
+	_, rows := mappedBatchToLegacy(batch)
 	if err := store.InsertSum(ctx, rows); err != nil {
 		t.Fatalf("inserting sum rows: %v", err)
 	}

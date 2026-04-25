@@ -3,8 +3,11 @@ package main
 import (
 	"context"
 	"log/slog"
+	"time"
 
 	colmetricspb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
+
+	"dash0.com/otlp-log-processor-backend/internal/otlpmap"
 )
 
 type dash0MetricsServiceServer struct {
@@ -23,14 +26,14 @@ func (m *dash0MetricsServiceServer) Export(ctx context.Context, request *colmetr
 	metricsReceivedCounter.Add(ctx, 1)
 
 	if m.store != nil {
-		rm := request.GetResourceMetrics()
-
-		if gaugeRows := MapGaugeRows(rm); len(gaugeRows) > 0 {
+		batch := otlpmap.MapRequest(request, time.Now())
+		gaugeRows, sumRows := mappedBatchToLegacy(batch)
+		if len(gaugeRows) > 0 {
 			if err := m.store.InsertGauge(ctx, gaugeRows); err != nil {
 				return nil, err
 			}
 		}
-		if sumRows := MapSumRows(rm); len(sumRows) > 0 {
+		if len(sumRows) > 0 {
 			if err := m.store.InsertSum(ctx, sumRows); err != nil {
 				return nil, err
 			}
