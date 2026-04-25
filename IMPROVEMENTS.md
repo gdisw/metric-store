@@ -3,17 +3,17 @@
 This document tracks the work that would still be needed before treating this OTLP metric storage service as a real production system. The current code is a working vertical slice (gRPC ingest → mapper → batcher → ClickHouse / memory), and this list captures the gaps to close — grouped by concern, with a rough sense of priority.
 
 > Legend: **P0** — required before any prod traffic. **P1** — required before scaling out / multi-tenant. **P2** — quality-of-life / cost / nice-to-have.
-
 ---
 
 ## 1. Security and transport hardening
 
 - **P0 — TLS / mTLS on the gRPC listener.** `internal/grpcserver/run.go` uses `grpc.Creds(insecure.NewCredentials())`. Production must terminate TLS on the listener (or behind a sidecar) and ideally require client certs for collector→backend fan-in. Wire `credentials.NewTLS(...)` from a configurable cert/key path or a secret mount.
 - **P0 — AuthN / AuthZ.** Today any client that can reach the port can ingest. Add at minimum a bearer-token / API-key interceptor (`grpc.UnaryInterceptor`/`StreamInterceptor`) and reject unauthenticated requests; ideally mTLS + token, with per-tenant identity for authz and rate limiting.
-- **P0 — ClickHouse password: avoid env literals in production.** The server accepts `CLICKHOUSE_PASSWORD` for convenience, but a password in the process environment is still easy to leak (logs, `/proc`, crash dumps). Prefer `--clickhouse.password-file` / `CLICKHOUSE_PASSWORD_FILE` with a path mounted from your secret system (K8s Secret, Vault, AWS SM, …), which override `CLICKHOUSE_PASSWORD` when set.
+- **P1 — Deprecate `CLICKHOUSE_PASSWORD` in operator docs (env leak).** The server still accepts `CLICKHOUSE_PASSWORD` for local dev and test ergonomics, but the supported path in deployments is `--clickhouse.password-file` / `CLICKHOUSE_PASSWORD_FILE` (file wins when set; matches Compose/K8s secret mounts). Tighten guidance when §1 P0 (TLS + auth) ships; only then is it worth removing the env fallback in code.
 - **P1 — Rate limiting / quotas.** Add per-peer or per-tenant rate limiting at the gRPC layer (token bucket interceptor). Pair with the existing backpressure (`ErrBackpressure` → `ResourceExhausted`) so noisy tenants can’t starve good ones.
 - **P1 — PII / sensitive attribute scrubbing.** `internal/otlpmap/mapper.go` ingests every resource/scope/attribute key as-is. Add a configurable allow/deny list and a hashing/redaction step before persistence.
 - **P2 — Request size + concurrency caps per peer.** `MaxRecvMsgSize` is global; consider per-connection limits and `grpc.MaxConcurrentStreams`.
+- **P2 — Document secret file permissions in K8s/Compose.** Default distroless `nonroot` (uid 65532) and Compose secret mounts are readable; call this out in future operator docs so `chmod` on host does not break reads.
 
 ---
 
@@ -36,11 +36,12 @@ This document tracks the work that would still be needed before treating this OT
 ## 3. Observability
 
 - **P0 — Replace stdout exporters with OTLP.** `internal/otelpipe/setup.go` wires `stdouttrace`, `stdoutmetric`, `stdoutlog` (all `WithPrettyPrint`). In production this floods stdout, makes logs unreadable, and ships nothing to a backend. Use `otlptracegrpc` / `otlpmetricgrpc` / `otlploggrpc` exporters, configured via standard env vars (`OTEL_EXPORTER_OTLP_ENDPOINT`, etc.).
+- **P1 (implementation debt until §3 P0) — `BatchProcessor` vs visible logs on crash.** A `log.BatchProcessor` for application logs can leave `docker logs` empty if the process exits before the next batch tick (e.g. `Ping` or `CreateTables` failure). Today a synchronous `log.NewSimpleProcessor` is used for the log pipeline so early failures are visible. When switching to OTLP, ensure `LoggerProvider.ForceFlush` / shutdown is invoked before process exit, or keep a direct stderr `slog` path for fatals.
 - **P0 — Health & readiness.** No probes today.
   - Implement `grpc.health.v1.Health` and register it on the gRPC server.
   - Optionally also expose an HTTP `/healthz` (process up) and `/readyz` (ClickHouse ping OK + batcher not stuck) on a separate admin port.
 - **P1 — Sampling.** `newTraceProvider()` uses `trace.AlwaysSample()`. At ingest scale this will swamp any tracing backend. Switch to `trace.ParentBased(trace.TraceIDRatioBased(...))` and make the ratio configurable.
-- **P1 — Log level / format configuration.** `slog` is initialized with the `otelslog` bridge defaults and no level knob. Add `--log-level`, `--log-format=json|text`, and route through `otelslog` only in environments where logs are not also captured by container stdout.
+- **P1 — Log level / format configuration (higher impact for containers).** `slog` uses the `otelslog` bridge with no level knob; every line becomes a large pretty-printed JSON object on stdout. Add `--log-level`, `--log-format=json|text`, and consider a flag to use plain `slog` to stderr in containers (or `otelslog` only when exporting logs to a real backend).
 - **P1 — Process-level metrics.** Add `runtime/metrics` (Go heap, goroutines, GC) and OS-level CPU/memory exporters; today only domain metrics are emitted.
 - **P2 — Histogram buckets / exemplars.** `store.batch.latency` uses default histogram buckets; tune for the expected p99 (e.g. explicit boundaries from 1ms → 10s) and enable exemplars so a slow flush links back to the gRPC trace.
 - **P2 — Cardinality of metric attributes.** `batchFailureReason` truncates `err.Error()` to 256 chars but still uses raw error text as an attribute value. Map errors to a small enum (`timeout`, `network`, `schema`, `auth`, `unknown`) before recording.
@@ -49,12 +50,12 @@ This document tracks the work that would still be needed before treating this OT
 
 ## 4. Configuration and packaging
 
-- **P0 — Environment-variable config.** Only flags are supported (`cmd/server/main.go`). Add env-var fallbacks (`LISTEN_ADDR`, `STORE`, `CLICKHOUSE_ADDR`, `CLICKHOUSE_DATABASE`, `CLICKHOUSE_USERNAME`, `CLICKHOUSE_PASSWORD_FILE`, `LOG_LEVEL`, `OTEL_EXPORTER_OTLP_ENDPOINT`, …). Standard pattern: `viper`/`envconfig` or hand-rolled `os.Getenv`.
-- **P0 — `flag.Parse()` ordering bug.** In `main.go`, `flag.Parse()` runs **after** `otelpipe.SetupOTelSDK(ctx)` and after the first `slog.Info(...)`. Today no flags affect those calls, but as soon as you add `--log-level` or `--otel-endpoint` it will silently be ignored. Move `flag.Parse()` to the very top of `main`.
-- **P0 — Dockerfile + container image.** No `Dockerfile`, no `.dockerignore`, no multistage build. Add a multistage `golang:1.26 → distroless/static` image, set a non-root user, drop capabilities, and pin a known port (`EXPOSE 4317`).
+- ~~**P0 — Environment-variable config.**~~ **Done (hand-rolled `os.Getenv` / `os.LookupEnv` in `main.go`);** remaining: `LOG_LEVEL` and `OTEL_*` in code (see §3 P0), not a second framework like `viper` unless the flag surface explodes.
+- ~~**P0 — `flag.Parse()` ordering bug.**~~ **Done** — `flag.Parse()` runs first in `main()`. `slog.SetDefault` / startup logging run after `SetupOTelSDK` so the global log provider exists before `otelslog` is materialized (see `internal/grpcserver/service.go` `Logger()`).
+- ~~**P0 — Dockerfile + container image.**~~ **Done** — see repo root `Dockerfile`, `.dockerignore`, and `Makefile` `docker-build` / `docker-run` targets.
 - **P1 — Deploy manifests.** No Helm chart / Kustomize / K8s YAML in the tree. Provide a chart with: `Deployment` (rolling update with `terminationGracePeriodSeconds` ≥ shutdown flush timeout), `Service`, `ServiceMonitor`/`PodMonitor`, `NetworkPolicy`, `PodDisruptionBudget`, `HorizontalPodAutoscaler`, secrets references.
-- **P1 — `docker-compose.yaml` for local dev.** Currently the README says “ensure ClickHouse is reachable” — give the user a one-shot `docker compose up` with the server + ClickHouse + (optionally) an OTel collector, and a small load generator service.
-- **P2 — Build reproducibility.** `Makefile` targets are minimal. Add `-trimpath`, version stamping (`-ldflags "-X main.version=..."`), `CGO_ENABLED=0`, and an `info` flag/endpoint that exposes build info.
+- ~~**P1 — `docker-compose.yaml` for local dev.**~~ **Done** — `docker-compose.yaml` (server + ClickHouse, health-gated, shared secret; README updated). **Still optional:** add an OTel Collector and/or a small load-generator service to the same compose file (see §10).
+- **P2 — Build reproducibility (partially done).** The Docker build uses `-trimpath`, `CGO_ENABLED=0`, and `-ldflags "-s -w -X main.version=…"`. **Still open:** an explicit `--version` / `GET /version` (or gRPC) that surfaces build metadata; align `main.version` with OTel `resource` `service.version` in `internal/otelpipe/setup.go` (still hardcoded to `1.0.0` there); add the same `ldflags` to `make build` if you want host binaries to match the image.
 
 ---
 
@@ -119,16 +120,17 @@ This document tracks the work that would still be needed before treating this OT
 - **P1 — `internal/grpcserver/service.go` log message.** `"export metrics: backpressure, queue full"` includes the error twice (in the message and in `slog.String("err", err.Error())`). Use `slog.Any("err", err)` and drop the literal in the message, or use OTel error semconv (`error.type`, `error.message`).
 - **P1 — `Run` shutdown error joining.** `errors.Join(flushErr, closeErr, serveErr)` where `serveErr` after `GracefulStop()` is typically `nil` or `grpc.ErrServerStopped`. Filter known-benign errors so the process exit code reflects real failures.
 - **P1 — `applyBatcherDefaults` treats `0` as “unset”.** This makes it impossible to configure `MaxBatchRetries = 0` (i.e. fail fast). Switch to pointer fields or a sentinel (`-1` = disabled).
+- **P2 — `otelslog` + `Logger()` initialization contract.** `Logger()` now uses `sync.Once` to create the bridge *after* `SetupOTelSDK` when called from `main` in the right order. A future `var _ = grpcserver.Logger()` (or an `init` that logs) would re-bind the provider at import time and resurrect the no-op / ordering bug. Prefer documenting this invariant or passing `*slog.Logger` into `RunConfig` if the surface grows.
 - **P2 — `cloneMap` returns an empty map for `nil`.** Forces ClickHouse `Map(...)` columns to always have a value, but allocates an empty map per row. The driver accepts a `nil` map; benchmark and drop the allocation if so.
 - **P2 — Hardcoded shutdown flush timeout (30s).** Promote to a flag/env var; a slow ClickHouse may need 1–2 minutes of drain on rolling restart.
-- **P2 — Service name / namespace baked into `otelpipe.setup.go`.** `service.name = "otlp-metrics-processor-backend"` and `service.namespace = "dash0-exercise"` are hardcoded. Read them from env / config.
+- **P2 — Service name / namespace / version in OTel `resource`.** `internal/otelpipe/setup.go` still hardcodes `service.name`, `service.namespace`, and `service.version` (e.g. `1.0.0`) even though the binary is stamped with `main.version` in the image. Read them from env / build metadata and keep them in sync with startup logs.
 
 ---
 
 ## 10. Testing and load
 
 - **P1 — Race detector in CI.** Add `-race` to the standard test target; the batcher has explicit concurrency that should be exercised.
-- **P1 — End-to-end load test.** No reproducible benchmark today. Add a small `cmd/loadgen` (or a `ghz` script) that generates a configurable mix of gauge + sum + duplicate-fingerprint traffic and asserts on backpressure rate, p99 flush latency, and ClickHouse part counts.
+- **P1 — End-to-end load test.** No reproducible benchmark today. Add a small `cmd/loadgen` (or a `ghz` script) that generates a configurable mix of gauge + sum + duplicate-fingerprint traffic and asserts on backpressure rate, p99 flush latency, and ClickHouse part counts. The README’s `telemetrygen` one-liner is a manual stand-in, not a regression gate.
 - **P1 — Chaos test for the batcher.** A test that injects intermittent ClickHouse failures (already partially supported via `WithFailingWriteCalls` on the memory store) and asserts the buffer doesn’t grow without bound.
 - **P2 — Mapper fuzz.** Property-based / fuzz tests for `MapRequest` to make sure malformed OTLP doesn’t panic.
 
@@ -137,6 +139,7 @@ This document tracks the work that would still be needed before treating this OT
 ## 11. Documentation
 
 - **P1 — Runbook.** What to do when `queue.dropped` is increasing, when `store.batch.failed` is non-zero, when ClickHouse merges back up. Today only `README.md` covers the happy path.
+- **P1 — ClickHouse data volume and password changes.** A named Compose volume (`clickhouse-data`) persists user + password that ClickHouse set on *first* init. If you change only `.secrets/ch_password` to a new value, the server app may use the new password while the old DB user still has the old hash — you get `Authentication failed` (code 516) until you `docker compose down -v` and re-provision, or `ALTER USER` from inside. Document this in the runbook and README.
 - **P2 — Dashboard JSON.** Ship a vendor-agnostic dashboard definition pinned to the metric names in `internal/store/otel_batcher.go` and `internal/grpcserver/export_otel.go` so first-time operators have something to import into their visualization tool.
 - **P2 — Capacity / sizing notes.** Suggested `SizeFlushThreshold`, `MaxMetadataChannel`, `MaxDatapointChannel` defaults vs. RPS; how fingerprint cardinality affects memory in the LRU.
 
@@ -146,13 +149,14 @@ This document tracks the work that would still be needed before treating this OT
 
 If forced to pick the smallest meaningful slice before going live, it would be:
 
-1. TLS + bearer-token auth on the gRPC listener.
-2. Secrets via env / file, not flags.
-3. Dockerfile + minimal Helm/K8s manifests with health probes and graceful termination.
-4. OTLP (not stdout) exporters for traces / metrics / logs.
-5. External, versioned migrations (drop `CreateTables` from server boot).
-6. CI with `vet` + `staticcheck` + race tests + `govulncheck`.
-7. Bounded accumulator + alert on `store.batch.failed` + dead-letter sink.
-8. Drop `flag.Parse()` ordering bug; promote service name / shutdown timeout / log level / OTel endpoint to config.
+1. **TLS + bearer-token auth** on the gRPC listener.
+2. **Strip `CLICKHOUSE_PASSWORD` from operators’ mental model** in favor of the file/secret path (code may keep env fallback a bit longer for dev).
+3. **Helm/K8s manifests** (or equivalent) with health/readiness probes, `terminationGracePeriodSeconds` ≥ batcher flush, and secret refs — *the Dockerfile alone is not enough.*
+4. **OTLP** (not stdout) exporters for traces / metrics / logs; **align** `main.version` / OTel `service.version` and add `ForceFlush` or stderr logging for early fatal paths.
+5. **External, versioned migrations** (drop `CreateTables` from server boot for roles that are not the migrator).
+6. **CI** with `vet` + `staticcheck` + race tests + `govulncheck` + container build (and optional image scan).
+7. **Bounded accumulator + dead-letter** on `store.batch.failed` + alert wiring.
+
+~~**Already closed vs. the previous summary list:** `flag.Parse()` order; env fallbacks in `main`; hand-rolled password file; Dockerfile + local Compose; build stamping in the image.~~
 
 Everything else in this document is incremental hardening on top of that base.
