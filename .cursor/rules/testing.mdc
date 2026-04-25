@@ -1,0 +1,21 @@
+---
+description: Table-driven tests, integration tags, and testcontainers usage
+globs: "**/*_test.go"
+alwaysApply: false
+---
+
+# Testing
+
+## Unit tests
+
+- Prefer **table-driven** tests (`tests := []struct{ ... }{ ... }`) for multiple inputs and edge cases.
+- Avoid `time.Sleep` in tests unless unavoidable; if used, add a **short comment** explaining why (e.g. waiting for a bounded channel or background flush).
+
+## Integration tests
+
+- Files that need a real database or external service must be behind `//go:build integration` and run separately from default `go test`.
+- Use **testcontainers** (or the project’s existing harness) to start ClickHouse (or dependencies) in tests; do not require a manually provisioned local instance for CI.
+
+## Assertions
+
+- Keep failures actionable: include the input case name and relevant diffs (e.g. fingerprint, row counts) in `t.Fatalf` / `t.Errorf` messages.

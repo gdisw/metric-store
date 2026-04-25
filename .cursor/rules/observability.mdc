@@ -1,0 +1,25 @@
+---
+description: Metrics, logs, and trace correlation for gRPC and storage paths
+globs: "**/*.go"
+alwaysApply: false
+---
+
+# Observability
+
+## Metrics naming
+
+- Use dot-separated names: `domain.subject.action` (e.g. `otlp.export.received`, `clickhouse.batch.inserted`).
+- Counters for discrete events; histograms for durations and sizes where percentiles matter.
+
+## gRPC handlers
+
+- Each new gRPC handler should emit at least **one counter** (requests or outcomes) and **one latency histogram** for the handler or critical subsection.
+
+## Logs
+
+- Use structured `slog` with key/value pairs; derive attributes from `context` when available (e.g. trace id from OpenTelemetry).
+- When logging an error path, include `trace_id` (and other correlation ids) so logs join to traces.
+
+## Consistency
+
+- Prefer reusing existing metric and attribute names when extending the same flow (export, batch flush, queue pressure) instead of introducing synonyms.

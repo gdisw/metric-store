@@ -1,0 +1,24 @@
+---
+description: ClickHouse schema and query conventions for this metric store
+globs:
+  - "**/store/**/*.go"
+  - "**/clickhouse*.go"
+alwaysApply: false
+---
+
+# ClickHouse conventions
+
+## Schema
+
+- Time-series fact tables that store a `TimeUnix` (or equivalent event time) **must** use `PARTITION BY toDate(TimeUnix)` (or the documented event-time column) so queries stay partition-pruned.
+- `ORDER BY` should lead with low-cardinality / selective keys first (e.g. fingerprint or series id), then time, unless a different primary access path is explicitly documented.
+- Prefer `ReplacingMergeTree` for idempotent metadata / dimension upserts when a version or “last seen” column defines the winning row.
+- Choose codecs by column semantics: `Delta` / `DoubleDelta` for ordered integers and timestamps, `Gorilla` for float series, `ZSTD` for compressible text and maps.
+
+## Application queries
+
+- Do not use `SELECT *` in application code; name columns explicitly for stable contracts and smaller reads.
+- Never ship unbounded queries (always bound time range and/or limit, and rely on partition pruning).
+- For inserts, ALWAYS use the native ClickHouse batch API (e.g., `conn.PrepareBatch(ctx, "INSERT INTO...")` and `batch.Append()`). NEVER execute `INSERT` queries directly in a loop with `db.Exec`.
+
+When adding a new table, align DDL and Go insert/select lists so migrations and writers stay in sync.

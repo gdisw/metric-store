@@ -1,0 +1,30 @@
+---
+description: Go coding standards — errors, context, logging, performance, and package hygiene
+globs: "**/*.go"
+alwaysApply: false
+---
+
+# Go style
+
+## API design & Types
+- **Accept interfaces, return structs.** Inputs should be as broad as possible (interfaces like `io.Reader` or our custom `Store`), while outputs should be specific concrete types/structs.
+- `context.Context` is the first parameter of functions that need cancellation, deadlines, or tracing.
+- Avoid mutable global state in `internal/*`; inject dependencies (store, batcher, cache) explicitly via constructors.
+- Libraries under `internal/` must not `panic` for expected failures; return explicit errors.
+
+## Errors
+- Wrap errors with `%w` so callers can use `errors.Is` / `errors.As`.
+- Add context with `fmt.Errorf("doing X: %w", err)` rather than string concatenation alone.
+
+## Logging & Observability
+- Use standard library `log/slog` (structured). DO NOT use `log.Print` / `println` or `fmt.Println` in production paths.
+- Prefer passing `context.Context` into helpers that log so trace correlation stays consistent.
+
+## Performance & Concurrency (CRITICAL FOR TSDB)
+- **Zero-allocation loops:** In high-throughput ingestion paths, avoid reallocating memory. Reuse slices (e.g., `buffer = buffer[:0]` to reset length but keep capacity).
+- **Concurrency:** Prefer channels and `select` statements for background workers over `sync.Mutex`. Only use `sync.RWMutex` or `sync.Map` for read-heavy caching.
+- Graceful shutdown: Always use `sync.WaitGroup` and a `stop/done` channel to ensure background workers flush remaining data before exiting.
+
+## Imports
+- No naked imports (side-effect imports must have a comment explaining why, per `go vet`).
+- Group stdlib, blank line, third party, blank line, local module.
