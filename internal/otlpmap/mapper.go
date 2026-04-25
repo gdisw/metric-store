@@ -9,8 +9,8 @@ import (
 	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
 	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
 
-	"dash0.com/otlp-log-processor-backend/internal/fingerprint"
-	"dash0.com/otlp-log-processor-backend/internal/store"
+	"gdisw/metric-store/internal/fingerprint"
+	"gdisw/metric-store/internal/store"
 )
 
 type MappedBatch struct {

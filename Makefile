@@ -1,4 +1,4 @@
-MODULE := dash0.com/otlp-log-processor-backend
+MODULE := gdisw/metric-store
 
 .PHONY: build run test test-integration test-all fmt vet lint tidy clean
 
@@ -6,7 +6,7 @@ build:
 	go build ./...
 
 run:
-	go run ./cmd/server
+	go run ./cmd/server --store=clickhouse
 
 run-memory:
 	go run ./cmd/server --store=memory

@@ -17,9 +17,9 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
 
-	"dash0.com/otlp-log-processor-backend/internal/grpcserver"
-	"dash0.com/otlp-log-processor-backend/internal/otlpmap"
-	"dash0.com/otlp-log-processor-backend/internal/store"
+	"gdisw/metric-store/internal/grpcserver"
+	"gdisw/metric-store/internal/otlpmap"
+	"gdisw/metric-store/internal/store"
 )
 
 func testExportMetrics(t *testing.T) *grpcserver.ExportMetrics {

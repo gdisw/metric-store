@@ -9,7 +9,7 @@ import (
 	chgo "github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 
-	"dash0.com/otlp-log-processor-backend/internal/store"
+	"gdisw/metric-store/internal/store"
 )
 
 type Config struct {

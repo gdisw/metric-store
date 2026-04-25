@@ -12,8 +12,8 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 
-	"dash0.com/otlp-log-processor-backend/internal/store"
-	chstore "dash0.com/otlp-log-processor-backend/internal/store/clickhouse"
+	"gdisw/metric-store/internal/store"
+	chstore "gdisw/metric-store/internal/store/clickhouse"
 )
 
 // recentDatapointTime returns a TimeUnix in the last few days so TTL (30d) has not dropped the part.

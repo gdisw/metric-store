@@ -5,8 +5,8 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"dash0.com/otlp-log-processor-backend/internal/grpcserver"
-	"dash0.com/otlp-log-processor-backend/internal/store"
+	"gdisw/metric-store/internal/grpcserver"
+	"gdisw/metric-store/internal/store"
 )
 
 // metricsStoreSpy counts Close calls for shutdown / leak regressions.

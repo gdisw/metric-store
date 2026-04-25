@@ -10,10 +10,10 @@ import (
 	"os/signal"
 	"syscall"
 
-	"dash0.com/otlp-log-processor-backend/internal/grpcserver"
-	"dash0.com/otlp-log-processor-backend/internal/otelpipe"
-	"dash0.com/otlp-log-processor-backend/internal/store"
-	chstore "dash0.com/otlp-log-processor-backend/internal/store/clickhouse"
+	"gdisw/metric-store/internal/grpcserver"
+	"gdisw/metric-store/internal/otelpipe"
+	"gdisw/metric-store/internal/store"
+	chstore "gdisw/metric-store/internal/store/clickhouse"
 )
 
 var (

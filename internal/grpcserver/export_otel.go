@@ -6,7 +6,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/metric"
 
-	"dash0.com/otlp-log-processor-backend/internal/store"
+	"gdisw/metric-store/internal/store"
 )
 
 // ExportMetrics holds OTLP gRPC-level OpenTelemetry instruments for a single

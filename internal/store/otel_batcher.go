@@ -10,7 +10,7 @@ import (
 	"go.opentelemetry.io/otel/metric"
 )
 
-const OTelScopeName = "dash0.com/otlp-log-processor-backend"
+const OTelScopeName = "gdisw/metric-store"
 
 // BatcherMetrics holds OpenTelemetry instruments for the async batcher and its queues.
 // Use [NewBatcherMetrics] to construct; a nil *BatcherMetrics is safe where batcher

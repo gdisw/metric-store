@@ -9,7 +9,7 @@ import (
 	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
 	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
 
-	"dash0.com/otlp-log-processor-backend/internal/store"
+	"gdisw/metric-store/internal/store"
 )
 
 func TestMapRequest_Deterministic(t *testing.T) {
@@ -259,9 +259,9 @@ func makeExportRequest(t *testing.T) *colmetricspb.ExportMetricsServiceRequest {
 						Scope:     &commonpb.InstrumentationScope{Name: "scope", Version: "v1"},
 						Metrics: []*metricspb.Metric{
 							{
-								Name:    "g",
-								Unit:    "1",
-								Data:    &metricspb.Metric_Gauge{Gauge: &metricspb.Gauge{
+								Name: "g",
+								Unit: "1",
+								Data: &metricspb.Metric_Gauge{Gauge: &metricspb.Gauge{
 									DataPoints: []*metricspb.NumberDataPoint{
 										{TimeUnixNano: 100, Value: &metricspb.NumberDataPoint_AsDouble{AsDouble: 3.14}},
 									},
@@ -274,4 +274,3 @@ func makeExportRequest(t *testing.T) *colmetricspb.ExportMetricsServiceRequest {
 		},
 	}
 }
-

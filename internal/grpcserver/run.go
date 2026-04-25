@@ -13,7 +13,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	"dash0.com/otlp-log-processor-backend/internal/store"
+	"gdisw/metric-store/internal/store"
 )
 
 // RunConfig controls the gRPC listener and batch writer.

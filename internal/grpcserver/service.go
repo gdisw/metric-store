@@ -14,8 +14,8 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"dash0.com/otlp-log-processor-backend/internal/otlpmap"
-	"dash0.com/otlp-log-processor-backend/internal/store"
+	"gdisw/metric-store/internal/otlpmap"
+	"gdisw/metric-store/internal/store"
 )
 
 var logger = otelslog.NewLogger(store.OTelScopeName)
