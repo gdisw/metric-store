@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -21,6 +22,8 @@ type Batcher struct {
 	drop   atomic.Uint64
 
 	lru *lru.Cache[uint64, struct{}]
+
+	enqueueMu sync.Mutex
 
 	metaCh chan MetadataRow
 	dpCh   chan DatapointRow
@@ -105,6 +108,9 @@ func (b *Batcher) Dropped() uint64 {
 }
 
 // Enqueue may skip metadata already in the LRU. Full queue: [ErrBackpressure].
+// A call either queues every row that still needs the channels (all-or-nothing for
+// this batch) or returns [ErrBackpressure] without leaving a prefix queued, so
+// retries do not duplicate datapoints.
 func (b *Batcher) Enqueue(ctx context.Context, metadata []MetadataRow, datapoints []DatapointRow) error {
 	if b.closed.Load() {
 		return errors.New("store batcher: closed")
@@ -112,25 +118,39 @@ func (b *Batcher) Enqueue(ctx context.Context, metadata []MetadataRow, datapoint
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+
+	b.enqueueMu.Lock()
+	defer b.enqueueMu.Unlock()
+
+	if b.closed.Load() {
+		return errors.New("store batcher: closed")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	needMeta := 0
 	for i := range metadata {
-		row := metadata[i]
-		if _, hit := b.lru.Get(row.Fingerprint); hit {
-			continue
-		}
-		select {
-		case b.metaCh <- row:
-		default:
-			b.drop.Add(1)
-			return ErrBackpressure
+		if _, hit := b.lru.Peek(metadata[i].Fingerprint); !hit {
+			needMeta++
 		}
 	}
-	for i := range datapoints {
-		select {
-		case b.dpCh <- datapoints[i]:
-		default:
-			b.drop.Add(1)
-			return ErrBackpressure
+	needDp := len(datapoints)
+
+	if needMeta > cap(b.metaCh)-len(b.metaCh) || needDp > cap(b.dpCh)-len(b.dpCh) {
+		b.drop.Add(uint64(len(metadata) + len(datapoints)))
+		return ErrBackpressure
+	}
+
+	for i := range metadata {
+		row := metadata[i]
+		if _, hit := b.lru.Peek(row.Fingerprint); hit {
+			continue
 		}
+		b.metaCh <- row
+	}
+	for i := range datapoints {
+		b.dpCh <- datapoints[i]
 	}
 	return nil
 }
@@ -198,22 +218,28 @@ func (b *Batcher) onFlushError(err error) {
 	}
 }
 
-// Flush stops the worker, drains, and flushes. Idempotent; returns last store error.
+// Flush stops the worker, drains, and flushes. Idempotent.
+// If ctx is cancelled or times out before the worker exits, Flush still blocks until
+// the worker goroutine has finished (so callers may Close the store safely afterward).
+// Any context error is joined with a failed flush error from the store, if any.
 func (b *Batcher) Flush(ctx context.Context) error {
 	if !b.closed.Swap(true) {
 		close(b.stopCh)
 	}
+	var ctxErr error
 	select {
 	case <-b.done:
 	case <-ctx.Done():
-		return ctx.Err()
+		ctxErr = ctx.Err()
+		<-b.done
 	}
+	var flushErr error
 	if v := b.flushErr.Load(); v != nil {
 		if err, _ := v.(error); err != nil {
-			return err
+			flushErr = err
 		}
 	}
-	return nil
+	return errors.Join(ctxErr, flushErr)
 }
 
 func (b *Batcher) setFlushErr(err error) {

@@ -188,6 +188,33 @@ func TestBatcher_EnqueueAfterFlush(t *testing.T) {
 	}
 }
 
+// Flush must not return while the worker still holds the store, even if the
+// caller's flush context times out first (see grpcserver shutdown vs store.Close).
+func TestBatcher_FlushWaitsForWorkerAfterTimeout(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	mem := NewMemory(WithLatency(80 * time.Millisecond))
+	cfg := DefaultBatcherConfig()
+	cfg.SizeFlushThreshold = 100
+	cfg.FlushInterval = time.Hour
+	b, err := NewBatcher(mem, cfg)
+	if err != nil {
+		t.Fatalf("NewBatcher: %v", err)
+	}
+	if err := b.Enqueue(ctx, []MetadataRow{{Fingerprint: 1, ServiceName: "s"}}, nil); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	flushCtx, cancel := context.WithTimeout(context.Background(), 2*time.Millisecond)
+	defer cancel()
+	flushErr := b.Flush(flushCtx)
+	if !errors.Is(flushErr, context.DeadlineExceeded) {
+		t.Fatalf("Flush: want DeadlineExceeded, got %v", flushErr)
+	}
+	if mem.CountMetadata() != 1 {
+		t.Fatalf("worker should finish store write after ctx timeout; CountMetadata=%d", mem.CountMetadata())
+	}
+}
+
 func TestBatcher_DatapointOnlyBatch(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -209,4 +236,50 @@ func TestBatcher_DatapointOnlyBatch(t *testing.T) {
 	if len(dps) != 1 || dps[0].Value != 1.5 {
 		t.Fatalf("datapoints: got %#v", dps)
 	}
+}
+
+// Regression: backpressure must not leave a prefix of metadata or datapoints
+// queued (retries would duplicate datapoints in the store).
+func TestBatcher_EnqueueAllOrNothingOnDatapointBackpressure(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	mem := NewMemory(WithLatency(300 * time.Millisecond))
+	cfg := DefaultBatcherConfig()
+	cfg.SizeFlushThreshold = 1
+	cfg.FlushInterval = time.Hour
+	cfg.MaxMetadataChannel = 8
+	cfg.MaxDatapointChannel = 2
+
+	b, err := NewBatcher(mem, cfg)
+	if err != nil {
+		t.Fatalf("NewBatcher: %v", err)
+	}
+	// Worker blocks in Upsert; datapoints pile up in dpCh because the worker is not in its receive loop.
+	if err := b.Enqueue(ctx, []MetadataRow{{Fingerprint: 1}}, nil); err != nil {
+		t.Fatalf("Enqueue meta1: %v", err)
+	}
+	time.Sleep(25 * time.Millisecond)
+	if err := b.Enqueue(ctx, nil, []DatapointRow{{Fingerprint: 1, Value: 1}}); err != nil {
+		t.Fatalf("Enqueue dp1: %v", err)
+	}
+	if err := b.Enqueue(ctx, nil, []DatapointRow{{Fingerprint: 1, Value: 2}}); err != nil {
+		t.Fatalf("Enqueue dp2: %v", err)
+	}
+	err = b.Enqueue(ctx,
+		[]MetadataRow{{Fingerprint: 2, ServiceName: "s"}},
+		[]DatapointRow{{Fingerprint: 2, Value: 3}, {Fingerprint: 2, Value: 4}},
+	)
+	if !errors.Is(err, ErrBackpressure) {
+		t.Fatalf("combined Enqueue: got %v want ErrBackpressure", err)
+	}
+	if _, ok := mem.Metadata(2); ok {
+		t.Fatal("metadata for fingerprint 2 must not appear when Enqueue fails")
+	}
+	if n := len(mem.DatapointsByFingerprint(2)); n != 0 {
+		t.Fatalf("datapoints for fp 2: got %d want 0 before retry", n)
+	}
+	if got := b.Dropped(); got != 3 {
+		t.Fatalf("Dropped: got %d want 3 (1 meta + 2 dps rejected as one batch)", got)
+	}
+	_ = b.Flush(context.Background())
 }
