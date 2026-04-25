@@ -1,6 +1,7 @@
 MODULE := gdisw/metric-store
+IMAGE ?= otlp-metrics-server:dev
 
-.PHONY: build run test test-integration test-all fmt vet lint tidy clean
+.PHONY: build run test test-integration test-all fmt vet lint tidy clean docker-build docker-run
 
 build:
 	go build ./...
@@ -37,3 +38,9 @@ tidy:
 
 clean:
 	go clean ./...
+
+docker-build:
+	docker build -t $(IMAGE) .
+
+docker-run:
+	docker run --rm -p 4317:4317 -e STORE=memory $(IMAGE)

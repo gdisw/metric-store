@@ -1,0 +1,7 @@
+.git
+terminals
+.cursor
+.idea
+.vscode
+*.md
+!README.md

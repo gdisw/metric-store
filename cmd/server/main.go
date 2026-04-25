@@ -16,8 +16,10 @@ import (
 	"gdisw/metric-store/internal/grpcserver"
 	"gdisw/metric-store/internal/otelpipe"
 	"gdisw/metric-store/internal/store"
-	chstore "gdisw/metric-store/internal/store/clickhouse"
+	chstore 	"gdisw/metric-store/internal/store/clickhouse"
 )
+
+var version = "dev"
 
 func envOr(key, def string) string {
 	if v, ok := os.LookupEnv(key); ok && v != "" {
@@ -49,7 +51,7 @@ func main() {
 	flag.Parse()
 
 	slog.SetDefault(grpcserver.Logger())
-	slog.Info("starting OTLP metrics server")
+	slog.Info("starting OTLP metrics server", slog.String("version", version))
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
